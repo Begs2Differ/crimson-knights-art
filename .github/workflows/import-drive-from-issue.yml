@@ -17,13 +17,14 @@ jobs:
         with:
           ref: main
       - name: Install Drive downloader
-        run: python3 -m pip install --user gdown==5.2.0
+        run: python3 -m pip install --user gdown==5.2.0 requests==2.32.3 beautifulsoup4==4.12.3
       - name: Download and validate
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
           python3 - <<'PY'
-          import json, os, pathlib, re, subprocess
+          import json, os, pathlib, re, subprocess, requests, urllib.parse
+          from bs4 import BeautifulSoup
           data=json.loads(os.environ["ISSUE_BODY"])
           if set(data) != {"file_id","filename"}:
               raise SystemExit("Expected file_id and filename only")
@@ -38,7 +39,32 @@ jobs:
           destination=pathlib.Path(name)
           if destination.exists():
               raise SystemExit("Refusing to overwrite existing file")
-          subprocess.run(["python3","-m","gdown","--id",ident,"-O",name],check=True,timeout=120)
+          try:
+              subprocess.run(["python3","-m","gdown",ident,"-O",name],check=True,timeout=120)
+          except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+              print("gdown did not download; trying Drive browser confirmation flow")
+              session=requests.Session()
+              session.headers.update({"User-Agent":"Mozilla/5.0"})
+              response=session.get("https://drive.google.com/uc",params={"export":"download","id":ident},timeout=45)
+              response.raise_for_status()
+              if response.content.startswith((b"\\x89PNG\\r\\n\\x1a\\n",b"\\xff\\xd8\\xff")):
+                  destination.write_bytes(response.content)
+              else:
+                  soup=BeautifulSoup(response.text,"html.parser")
+                  forms=[form for form in soup.find_all("form") if "download" in (form.get("action") or "")]
+                  if not forms:
+                      raise SystemExit("Drive did not provide a downloadable file or confirmation form")
+                  form=forms[0]
+                  action=urllib.parse.urljoin(response.url,form.get("action"))
+                  parsed=urllib.parse.urlparse(action)
+                  if parsed.scheme!="https" or parsed.hostname not in ("drive.google.com","drive.usercontent.google.com"):
+                      raise SystemExit("Unexpected Drive confirmation host")
+                  fields={item.get("name"):item.get("value","") for item in form.find_all("input") if item.get("name")}
+                  method=(form.get("method") or "get").lower()
+                  response=session.post(action,data=fields,timeout=60) if method=="post" else session.get(action,params=fields,timeout=60)
+                  response.raise_for_status()
+                  destination.write_bytes(response.content)
+                  print("Fallback HTTP status",response.status_code,"bytes",len(response.content))
           if destination.stat().st_size > 20_000_000:
               destination.unlink()
               raise SystemExit("Image too large")
