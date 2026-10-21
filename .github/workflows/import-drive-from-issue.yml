@@ -1,0 +1,68 @@
+name: Import Google Drive image from request
+on:
+  issues:
+    types: [opened]
+permissions:
+  contents: write
+  issues: write
+concurrency:
+  group: import-drive-image
+  cancel-in-progress: false
+jobs:
+  import:
+    if: github.event.issue.user.login == 'Begs2Differ' && startsWith(github.event.issue.title, 'Import Drive image:')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Install Drive downloader
+        run: python3 -m pip install --user gdown==5.2.0
+      - name: Download and validate
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          data=json.loads(os.environ["ISSUE_BODY"])
+          if set(data) != {"file_id","filename"}:
+              raise SystemExit("Expected file_id and filename only")
+          ident, name=data["file_id"], data["filename"]
+          if not isinstance(ident,str) or not re.fullmatch(r"[a-zA-Z0-9_-]{10,150}", ident):
+              raise SystemExit("Invalid Drive file ID")
+          if not isinstance(name,str) or not name or name in (".","..") or "/" in name or "\\" in name:
+              raise SystemExit("Invalid filename")
+          ext=pathlib.Path(name).suffix.lower()
+          if ext not in (".png",".jpg",".jpeg"):
+              raise SystemExit("Only PNG and JPEG supported")
+          destination=pathlib.Path(name)
+          if destination.exists():
+              raise SystemExit("Refusing to overwrite existing file")
+          subprocess.run(["python3","-m","gdown","--id",ident,"-O",name],check=True,timeout=120)
+          if destination.stat().st_size > 20_000_000:
+              destination.unlink()
+              raise SystemExit("Image too large")
+          header=destination.open("rb").read(8)
+          if ext==".png" and header != b"\x89PNG\r\n\x1a\n":
+              destination.unlink()
+              raise SystemExit("Downloaded content is not PNG")
+          if ext in (".jpg",".jpeg") and not header.startswith(b"\xff\xd8\xff"):
+              destination.unlink()
+              raise SystemExit("Downloaded content is not JPEG")
+          print("Validated",name,destination.stat().st_size)
+          PY
+      - name: Commit original file
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          filename=$(python3 -c 'import json,os;print(json.loads(os.environ["ISSUE_BODY"])["filename"])')
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$filename"
+          git commit -m "Import Drive image: $filename"
+          git push origin HEAD:main
+      - name: Close completed request
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh issue close "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --comment "Original image imported and committed to main."
